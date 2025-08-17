@@ -27,6 +27,8 @@ interface PoliceFormData {
   policeStation: string;
   purpose: string;
   documentType: string;
+
+  [key: string]: any;
 }
 
 let browser: Browser | null = null;
@@ -60,7 +62,7 @@ app.post('/automate-police-form', upload.array('documents'), async (req, res) =>
     // Validate required fields
     const requiredFields = ['applicantName', 'fatherName', 'address', 'phoneNumber', 'policeStation'];
     for (const field of requiredFields) {
-      if (!formData[field]) {
+      if (!formData[field as keyof PoliceFormData]) {
         return res.status(400).json({ 
           error: `Missing required field: ${field}` 
         });
