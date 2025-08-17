@@ -12,45 +12,37 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---------- CORS allowlist ----------
+/* ------------------------- CORS allowlist via env ------------------------ */
 const raw = process.env.ALLOWED_ORIGINS || '';
 const ALLOWLIST = raw.split(',').map(s => s.trim()).filter(Boolean);
 
 const corsOptions: cors.CorsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // server-to-server, curl, etc.
+    if (!origin) return cb(null, true); // server-to-server, curl, Railway healthcheck
     if (ALLOWLIST.includes(origin)) return cb(null, true);
-    // optional wildcard support for subdomains, e.g., *.railway.app
+    // wildcard like *.railway.app
     if (ALLOWLIST.some(pat => pat.startsWith('*.') && origin.endsWith(pat.slice(1)))) {
       return cb(null, true);
     }
-    cb(new Error(`CORS: Origin ${origin} not allowed`));
+    return cb(new Error(`CORS: Origin ${origin} not allowed`));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'x-api-key'],
+  allowedHeaders: ['Content-Type'],
   credentials: false,
-  maxAge: 600,
+  maxAge: 600
 };
 
+/* ----------------------------- Health first ------------------------------ */
+app.get('/health', (_req, res) => res.status(200).send('OK'));
+
+/* ------------------------------- CORS/body ------------------------------- */
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
-
-// ---------- API key guard (optional) ----------
-app.use((req, res, next) => {
-  const required = process.env.API_KEY;
-  if (!required) return next();
-  const key = req.headers['x-api-key'];
-  if (key === required) return next();
-  return res.status(401).json({ ok: false, error: 'Unauthorized' });
-});
-
-// ---------- Body parsing ----------
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// ---------- Types & helpers ----------
+/* --------------------------------- Types --------------------------------- */
 interface PoliceFormData {
-  // required core fields
   id_type: string;
   id_number: string;
   first_name: string;
@@ -67,7 +59,7 @@ interface PoliceFormData {
   phone: string;
   permanent_address: string;
 
-  // optional extras / fallbacks
+  // optional/extra fields
   age?: string;
   address_of_rented_property?: string;
   rent_amount?: string;
@@ -88,10 +80,10 @@ interface PoliceFormData {
   passport_photo_url: string;
   combined_id_photo_url?: string;
 
-  // allow dynamic lookups
-  [key: string]: any;
+  [key: string]: any; // allow dynamic lookup
 }
 
+/* -------------------------------- Helpers -------------------------------- */
 function assertDOB_DDMMYYYY(input: string) {
   if (!/^\d{2}-\d{2}-\d{4}$/.test(input)) {
     throw new Error('DOB must be in DD-MM-YYYY format');
@@ -100,26 +92,18 @@ function assertDOB_DDMMYYYY(input: string) {
 }
 
 function computeAgeFromDob(dob: string): string {
-  // dob: DD-MM-YYYY
   try {
     const [dd, mm, yyyy] = dob.split('-').map(Number);
     const now = new Date();
     let age = now.getFullYear() - yyyy;
-    const m = now.getMonth() + 1;
-    const d = now.getDate();
-    const hadBirthday = (m > mm) || (m === mm && d >= dd);
+    const hadBirthday = (now.getMonth() + 1 > mm) || ((now.getMonth() + 1 === mm) && now.getDate() >= dd);
     if (!hadBirthday) age -= 1;
     return String(age);
-  } catch {
-    return '';
-  }
+  } catch { return ''; }
 }
 
 async function downloadToTemp(urlOrPath: string): Promise<string> {
-  // If given an absolute local path, use it directly
   if (urlOrPath.startsWith('/') || /^[a-zA-Z]:\\/.test(urlOrPath)) return urlOrPath;
-
-  // Otherwise assume URL – use global fetch (Node 18+)
   const resp = await fetch(urlOrPath);
   if (!resp.ok) throw new Error(`Failed to fetch file: ${urlOrPath}`);
   const buf = Buffer.from(await resp.arrayBuffer());
@@ -170,25 +154,18 @@ async function selectWithPostback(page: Page, selector: string, labelOrValue: st
   try { await page.selectOption(selector, { label: labelOrValue }); }
   catch { await page.selectOption(selector, labelOrValue); }
   await page.waitForLoadState('networkidle');
-  await page.waitForFunction((sel) => {
+  await page.waitForFunction((sel: string) => {
     const el = document.querySelector(sel) as HTMLSelectElement | null;
-    return el && el.options && el.options.length > 1;
+    return !!el && el.options && el.options.length > 1;
   }, nextSelector);
 }
 
-// ---------- Health ----------
-app.get('/health', (_req, res) => {
-  res.status(200).send('OK');
-});
-
-// ---------- Main route ----------
+/* --------------------------------- Route --------------------------------- */
 app.post('/api/police/submit/tenant', async (req, res) => {
   const p: PoliceFormData = req.body;
-  try { assertDOB_DDMMYYYY(p.date_of_birth); } catch (e: any) {
-    return res.status(400).json({ ok: false, error: e.message });
-  }
+  try { assertDOB_DDMMYYYY(p.date_of_birth); }
+  catch (e: any) { return res.status(400).json({ ok: false, error: e.message }); }
 
-  // Defaults
   const def = {
     availFrom: '10',
     availTo: '18',
@@ -205,8 +182,9 @@ app.post('/api/police/submit/tenant', async (req, res) => {
     landlordAddress: p.landlord_address || 'XYZ,ASD,JAIPUR',
     landlordDistrict: p.landlord_police_district || 'JAIPUR EAST',
     landlordStation: p.landlord_police_station || 'RAMNAGARIYA',
-    referencedBy: p.referenced_by || 'ONLINE',
+    referencedBy: p.referenced_by || 'ONLINE'
   };
+
   const computedAge = p.age || computeAgeFromDob(p.date_of_birth);
 
   const browser = await chromium.launch({ headless: true });
@@ -217,7 +195,6 @@ app.post('/api/police/submit/tenant', async (req, res) => {
     await page.goto('https://www.police.rajasthan.gov.in/old/verificationform.aspx', { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle');
 
-    // Switch to Tenant Uploads tab if present
     const tenantTab = page.locator('text=Tenant Uploads');
     if (await tenantTab.count()) {
       await tenantTab.first().click();
@@ -243,14 +220,14 @@ app.post('/api/police/submit/tenant', async (req, res) => {
     await setIfExists(page, ['#ContentPlaceHolder1_txtTAge'], computedAge);
     await setIfExists(page, ['#ContentPlaceHolder1_txtTtntNo', '#ContentPlaceHolder1_txtTPhone'], p.phone);
 
-    // Cascading selects: Tenant location
+    // Tenant location cascade
     if (await page.locator('#ContentPlaceHolder1_ddlTState').count()) {
       await selectWithPostback(page, '#ContentPlaceHolder1_ddlTState', p.tenant_state, '#ContentPlaceHolder1_ddlTDistrict');
       await selectWithPostback(page, '#ContentPlaceHolder1_ddlTDistrict', p.tenant_police_district, '#ContentPlaceHolder1_ddlTStation');
       await selectIfExists(page, ['#ContentPlaceHolder1_ddlTStation', '#ContentPlaceHolder1_ddlTPoliceStation'], p.tenant_police_station);
     }
 
-    // Address & purpose
+    // Addresses & purpose
     await setIfExists(page, ['#ContentPlaceHolder1_txtTAddress'], p.permanent_address);
     await selectIfExists(page, ['#ContentPlaceHolder1_ddlpurpose'], def.purpose);
     await setIfExists(page, ['#ContentPlaceHolder1_txtaddressofrented', '#ContentPlaceHolder1_txtPAddress'], def.rentedAddress);
@@ -270,10 +247,12 @@ app.post('/api/police/submit/tenant', async (req, res) => {
     await setIfExists(page, ['#ContentPlaceHolder1_txtlandMobno', '#ContentPlaceHolder1_txtLPhone'], def.landlordMobile);
     await setIfExists(page, ['#ContentPlaceHolder1_txtlandPAddress', '#ContentPlaceHolder1_txtLAddress'], def.landlordAddress);
 
-    // Landlord district/station (postback)
+    // Landlord district/station cascade
     if (await page.locator('#ContentPlaceHolder1_ddlLdistrict, #ContentPlaceHolder1_ddlLDistrict').count()) {
-      const lDistSel = (await page.locator('#ContentPlaceHolder1_ddlLdistrict').count()) ? '#ContentPlaceHolder1_ddlLdistrict' : '#ContentPlaceHolder1_ddlLDistrict';
-      const lNext = (await page.locator('#ContentPlaceHolder1_ddlLStation').count()) ? '#ContentPlaceHolder1_ddlLStation' : '#ContentPlaceHolder1_ddlLPoliceStation';
+      const lDistSel = (await page.locator('#ContentPlaceHolder1_ddlLdistrict').count())
+        ? '#ContentPlaceHolder1_ddlLdistrict' : '#ContentPlaceHolder1_ddlLDistrict';
+      const lNext = (await page.locator('#ContentPlaceHolder1_ddlLStation').count())
+        ? '#ContentPlaceHolder1_ddlLStation' : '#ContentPlaceHolder1_ddlLPoliceStation';
       await selectWithPostback(page, lDistSel, def.landlordDistrict, lNext);
       await selectIfExists(page, ['#ContentPlaceHolder1_ddlLStation', '#ContentPlaceHolder1_ddlLPoliceStation'], def.landlordStation);
     }
@@ -295,23 +274,17 @@ app.post('/api/police/submit/tenant', async (req, res) => {
     await Promise.all([
       page.click(SAVE_BTN),
       page.waitForLoadState('networkidle'),
-      page.waitForFunction(
-        (oldHtml) => document.documentElement.innerHTML !== oldHtml,
-        prevHtml,
-        { timeout: 25000 }
-      ),
+      page.waitForFunction((oldHtml: string) => document.documentElement.innerHTML !== oldHtml, prevHtml, { timeout: 25000 }),
     ]);
 
-    // Check for validation errors
+    // Validation check
     const hasError = await page.evaluate(() => {
       const summary = document.querySelector('.validation-summary,.ValidationSummary');
-      const spans = Array.from(document.querySelectorAll('span'));
-      const withErr = spans.some(s => /required|invalid|please select|enter/i.test(s.textContent || ''));
+      const spans = Array.from(document.querySelectorAll('span')) as HTMLSpanElement[];
+      const withErr = spans.some(s => /required|invalid|please select|enter/i.test(String(s.textContent || '')));
       return !!summary || withErr;
     });
-    if (hasError) {
-      throw new Error('Validation error on target site. Check required fields / formats.');
-    }
+    if (hasError) throw new Error('Validation error on target site. Check required fields / formats.');
 
     // Extract Reference No
     let referenceNo: string | null = null;
@@ -344,7 +317,7 @@ app.post('/api/police/submit/tenant', async (req, res) => {
   }
 });
 
-// ---------- Start ----------
+/* --------------------------------- Start --------------------------------- */
 app.listen(PORT, () => {
   console.log(`🚔 Police Form Automation Service running on :${PORT}`);
   console.log(`Health: http://localhost:${PORT}/health`);
