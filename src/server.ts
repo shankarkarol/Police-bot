@@ -10,18 +10,34 @@ import crypto from 'crypto';
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-/* ------------------------- CORS allowlist via env ------------------------ */
-const raw = process.env.ALLOWED_ORIGINS || '';
-const ALLOWLIST = raw.split(',').map(s => s.trim()).filter(Boolean);
+/* ------------------- crash guards (show in Railway logs) ------------------ */
+process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
+process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
+
+/* ------------------------------ health FIRST ------------------------------ */
+app.get('/health', (_req, res) => res.status(200).type('text/plain').send('OK'));
+
+/* ------------------------------- CORS setup ------------------------------- */
+/** Static allowlist + env (comma-separated) */
+const staticAllow = [
+  'https://hostel-hub-tenant-ma-production.up.railway.app',
+  'https://anandpg.netlify.app',
+  'https://railway.com', // ✅ added as requested
+];
+const envAllow = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const ALLOWLIST = Array.from(new Set([...staticAllow, ...envAllow]));
 
 const corsOptions: cors.CorsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // server-to-server, curl, Railway healthcheck
+    if (!origin) return cb(null, true); // health checks / curl / server-to-server
     if (ALLOWLIST.includes(origin)) return cb(null, true);
-    // wildcard like *.railway.app
-    if (ALLOWLIST.some(pat => pat.startsWith('*.') && origin.endsWith(pat.slice(1)))) {
+    // optional wildcard: allow patterns like *.railway.app
+    if (ALLOWLIST.some(p => p.startsWith('*.') && origin.endsWith(p.slice(1)))) {
       return cb(null, true);
     }
     return cb(new Error(`CORS: Origin ${origin} not allowed`));
@@ -29,15 +45,13 @@ const corsOptions: cors.CorsOptions = {
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type'],
   credentials: false,
-  maxAge: 600
+  maxAge: 600,
 };
 
-/* ----------------------------- Health first ------------------------------ */
-app.get('/health', (_req, res) => res.status(200).send('OK'));
-
-/* ------------------------------- CORS/body ------------------------------- */
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
+
+/* ----------------------------- body parsers ------------------------------- */
 app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -90,18 +104,17 @@ function assertDOB_DDMMYYYY(input: string) {
   }
   return input;
 }
-
 function computeAgeFromDob(dob: string): string {
   try {
     const [dd, mm, yyyy] = dob.split('-').map(Number);
     const now = new Date();
     let age = now.getFullYear() - yyyy;
-    const hadBirthday = (now.getMonth() + 1 > mm) || ((now.getMonth() + 1 === mm) && now.getDate() >= dd);
+    const hadBirthday =
+      (now.getMonth() + 1 > mm) || ((now.getMonth() + 1 === mm) && now.getDate() >= dd);
     if (!hadBirthday) age -= 1;
     return String(age);
   } catch { return ''; }
 }
-
 async function downloadToTemp(urlOrPath: string): Promise<string> {
   if (urlOrPath.startsWith('/') || /^[a-zA-Z]:\\/.test(urlOrPath)) return urlOrPath;
   const resp = await fetch(urlOrPath);
@@ -113,13 +126,11 @@ async function downloadToTemp(urlOrPath: string): Promise<string> {
   await fs.writeFile(tmp, buf);
   return tmp;
 }
-
 async function typeInto(page: Page, selector: string, text: string) {
   await page.waitForSelector(selector, { state: 'visible' });
   await page.fill(selector, '');
   await page.type(selector, text);
 }
-
 async function safeSelect(page: Page, selector: string, labelOrValue: string) {
   await page.waitForSelector(selector, { state: 'visible' });
   try {
@@ -128,7 +139,6 @@ async function safeSelect(page: Page, selector: string, labelOrValue: string) {
   } catch {}
   await page.selectOption(selector, labelOrValue);
 }
-
 async function setIfExists(page: Page, selectors: string[], value?: string) {
   if (!value) return;
   for (const sel of selectors) {
@@ -138,7 +148,6 @@ async function setIfExists(page: Page, selectors: string[], value?: string) {
     }
   }
 }
-
 async function selectIfExists(page: Page, selectors: string[], value?: string) {
   if (!value) return;
   for (const sel of selectors) {
@@ -148,7 +157,6 @@ async function selectIfExists(page: Page, selectors: string[], value?: string) {
     }
   }
 }
-
 async function selectWithPostback(page: Page, selector: string, labelOrValue: string, nextSelector: string) {
   await page.waitForSelector(selector, { state: 'visible' });
   try { await page.selectOption(selector, { label: labelOrValue }); }
@@ -156,7 +164,7 @@ async function selectWithPostback(page: Page, selector: string, labelOrValue: st
   await page.waitForLoadState('networkidle');
   await page.waitForFunction((sel: string) => {
     const el = document.querySelector(sel) as HTMLSelectElement | null;
-    return !!el && el.options && el.options.length > 1;
+    return !!el && (el as any).options && (el as any).options.length > 1;
   }, nextSelector);
 }
 
@@ -182,9 +190,8 @@ app.post('/api/police/submit/tenant', async (req, res) => {
     landlordAddress: p.landlord_address || 'XYZ,ASD,JAIPUR',
     landlordDistrict: p.landlord_police_district || 'JAIPUR EAST',
     landlordStation: p.landlord_police_station || 'RAMNAGARIYA',
-    referencedBy: p.referenced_by || 'ONLINE'
+    referencedBy: p.referenced_by || 'ONLINE',
   };
-
   const computedAge = p.age || computeAgeFromDob(p.date_of_birth);
 
   const browser = await chromium.launch({ headless: true });
@@ -250,9 +257,11 @@ app.post('/api/police/submit/tenant', async (req, res) => {
     // Landlord district/station cascade
     if (await page.locator('#ContentPlaceHolder1_ddlLdistrict, #ContentPlaceHolder1_ddlLDistrict').count()) {
       const lDistSel = (await page.locator('#ContentPlaceHolder1_ddlLdistrict').count())
-        ? '#ContentPlaceHolder1_ddlLdistrict' : '#ContentPlaceHolder1_ddlLDistrict';
+        ? '#ContentPlaceHolder1_ddlLdistrict'
+        : '#ContentPlaceHolder1_ddlLDistrict';
       const lNext = (await page.locator('#ContentPlaceHolder1_ddlLStation').count())
-        ? '#ContentPlaceHolder1_ddlLStation' : '#ContentPlaceHolder1_ddlLPoliceStation';
+        ? '#ContentPlaceHolder1_ddlLStation'
+        : '#ContentPlaceHolder1_ddlLPoliceStation';
       await selectWithPostback(page, lDistSel, def.landlordDistrict, lNext);
       await selectIfExists(page, ['#ContentPlaceHolder1_ddlLStation', '#ContentPlaceHolder1_ddlLPoliceStation'], def.landlordStation);
     }
@@ -274,7 +283,11 @@ app.post('/api/police/submit/tenant', async (req, res) => {
     await Promise.all([
       page.click(SAVE_BTN),
       page.waitForLoadState('networkidle'),
-      page.waitForFunction((oldHtml: string) => document.documentElement.innerHTML !== oldHtml, prevHtml, { timeout: 25000 }),
+      page.waitForFunction(
+        (oldHtml: string) => document.documentElement.innerHTML !== oldHtml,
+        prevHtml,
+        { timeout: 25000 }
+      ),
     ]);
 
     // Validation check
@@ -317,9 +330,9 @@ app.post('/api/police/submit/tenant', async (req, res) => {
   }
 });
 
-/* --------------------------------- Start --------------------------------- */
-app.listen(PORT, () => {
-  console.log(`🚔 Police Form Automation Service running on :${PORT}`);
-  console.log(`Health: http://localhost:${PORT}/health`);
+/* --------------------------------- start --------------------------------- */
+const port = Number(process.env.PORT || 3000);
+app.listen(port, '0.0.0.0', () => {
+  console.log(`🚦 Listening on 0.0.0.0:${port}`);
+  console.log(`Health: http://localhost:${port}/health`);
 });
-
