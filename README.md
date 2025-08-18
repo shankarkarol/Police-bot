@@ -107,6 +107,99 @@ fetch('/automate-police-form', {
 - **Container**: Docker
 - **Deployment**: Railway
 
+## Deployment Verification and Testing
+
+### Automated Testing
+
+Run comprehensive deployment verification tests:
+
+```bash
+# Test production deployment
+npm run test:deployment:prod
+
+# Test local development server
+npm run test:deployment:local
+
+# Test custom URL
+npm run test:deployment -- https://your-custom-url.com
+```
+
+### Manual Testing
+
+Quick health checks:
+
+```bash
+# Basic health check
+curl https://police-bot-production.up.railway.app/health
+
+# API health check with JSON response
+curl https://police-bot-production.up.railway.app/api/health
+
+# Test endpoint with sample data
+curl -X POST https://police-bot-production.up.railway.app/api/police-form/submit \
+  -H "Content-Type: application/json" \
+  -d '{"test": true}'
+```
+
+### Continuous Monitoring
+
+Monitor service health continuously:
+
+```bash
+# Start monitoring with default 5-minute intervals
+./scripts/monitor.sh
+
+# Monitor with custom interval (in seconds)
+./scripts/monitor.sh https://police-bot-production.up.railway.app 120
+```
+
+### Documentation
+
+- [Deployment Testing Guide](docs/deployment-testing.md) - Comprehensive testing instructions
+- [Troubleshooting Guide](docs/deployment-testing.md#troubleshooting) - Common issues and solutions
+
+## API Endpoints
+
+### Health Check
+```http
+GET /health
+GET /api/health
+```
+
+### Browser Status
+```http
+GET /api/browser-status
+```
+
+### Form Automation
+```http
+POST /api/police/submit/tenant
+POST /api/police-form/submit  # Compatibility endpoint
+Content-Type: application/json
+```
+
+**Test Request:**
+```json
+{"test": true}
+```
+
+**Production Request Body:**
+- `id_type` (required): ID card type
+- `id_number` (required): ID number
+- `first_name` (required): Full name of applicant
+- `last_name` (required): Last name
+- `father_first_name` (required): Father's first name
+- `father_last_name` (required): Father's last name
+- `caste` (required): Caste category
+- `date_of_birth` (required): Date in DD-MM-YYYY format
+- `tenant_state` (required): State name
+- `tenant_police_district` (required): Police district
+- `tenant_police_station` (required): Police station name
+- `phone` (required): Contact number
+- `permanent_address` (required): Complete address
+- `passport_photo_url` (required): URL to passport photo
+- Additional optional fields available
+
 ## Security Notes
 
 - All form data is processed in memory
