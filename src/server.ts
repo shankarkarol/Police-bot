@@ -137,17 +137,20 @@ const staticAllow = [
 // Parse environment origins and handle wildcard patterns
 const envAllow = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
-  .map(s => s.trim())
+  .map(s => s.trim()) // This should handle spaces
   .filter(Boolean);
 
 const ALLOWLIST = Array.from(new Set([...staticAllow, ...envAllow]));
 
 console.log('🔧 CORS Configuration:');
-console.log('📋 Allowed Origins:', ALLOWLIST);
+console.log('📋 Static Origins:', staticAllow);
+console.log('📋 Environment Origins:', envAllow);
+console.log('📋 Combined Allowed Origins:', ALLOWLIST);
 
 const corsOptions: cors.CorsOptions = {
   origin: (origin, cb) => {
     console.log(`🔍 CORS check for origin: ${origin}`);
+    console.log(`📋 Current allowlist: ${JSON.stringify(ALLOWLIST)}`);
     
     // Allow requests with no origin (same-origin, mobile apps, etc.)
     if (!origin) {
@@ -164,10 +167,21 @@ const corsOptions: cors.CorsOptions = {
     // Check wildcard patterns (handle both *.domain.com and https://*.domain.com)
     for (const allowed of ALLOWLIST) {
       if (allowed.includes('*')) {
+        console.log(`🔍 Checking wildcard pattern: ${allowed}`);
+        
         // Extract the pattern part after *
-        const pattern = allowed.includes('://') 
-          ? allowed.split('://')[1].slice(1) // remove * from https://*.domain.com
-          : allowed.slice(1); // remove * from *.domain.com
+        let pattern: string;
+        if (allowed.includes('://')) {
+          // https://*.domain.com -> .domain.com
+          const parts = allowed.split('://');
+          pattern = parts[1].slice(1); // remove * from *.domain.com
+        } else {
+          // *.domain.com -> .domain.com  
+          pattern = allowed.slice(1); // remove * from *.domain.com
+        }
+        
+        console.log(`🔍 Extracted pattern: ${pattern}`);
+        console.log(`🔍 Checking if ${origin} ends with ${pattern}`);
         
         if (origin.endsWith(pattern)) {
           console.log(`✅ Origin ${origin} matches wildcard pattern ${allowed}`);
@@ -176,19 +190,32 @@ const corsOptions: cors.CorsOptions = {
       }
     }
     
-    console.log(`❌ Origin ${origin} not allowed`);
-    return cb(new Error(`CORS: Origin ${origin} not allowed`));
+    console.log(`❌ Origin ${origin} not allowed - denying request`);
+    // Use cb(null, false) instead of cb(new Error(...)) for better CORS handling
+    return cb(null, false);
   },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: false,
-  optionsSuccessStatus: 204, // Some legacy browsers choke on 204
+  optionsSuccessStatus: 200, // Change from 204 to 200 for better compatibility
   preflightContinue: false,
   maxAge: 600,
 };
 
+// Apply CORS middleware
 app.use(cors(corsOptions));
+
+// Explicitly handle preflight requests
 app.options('*', cors(corsOptions));
+
+// Add a simple CORS test endpoint
+app.get('/api/cors-test', (req, res) => {
+  res.json({ 
+    message: 'CORS test successful',
+    origin: req.headers.origin,
+    timestamp: new Date().toISOString()
+  });
+});
 
 /* ----------------------------- body parsers ------------------------------- */
 app.use(express.json({ limit: '20mb' }));
