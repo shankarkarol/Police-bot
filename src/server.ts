@@ -16,10 +16,10 @@ process.on('uncaughtException', (err) => console.error('Uncaught Exception:', er
 process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
 
 /* --------------------------- Readiness State ---------------------------- */
-let isReady = false;
+let serverReady = false;
 let playwrightReady = false;
-let lastHealthCheckTime = 0;
-const HEALTH_CHECK_CACHE_DURATION = 30000; // Cache health check result for 30 seconds
+let lastBrowserCheckTime = 0;
+const BROWSER_CHECK_CACHE_DURATION = 120000; // Cache browser check result for 2 minutes
 
 // Get timeout from environment or default
 const getPlaywrightTimeout = () => {
@@ -29,26 +29,25 @@ const getPlaywrightTimeout = () => {
 
 /* --------------------------- Health Checks ------------------------------ */
 app.get('/health', async (_req, res) => {
+  // Lightweight health check - just verify server is running
+  if (!serverReady) {
+    return res.status(503).type('text/plain').send('Server starting...');
+  }
+  
+  // Server is ready - always return 200 for health check
+  // Browser readiness is checked separately and cached
+  res.status(200).type('text/plain').send('OK');
+});
+
+/* ----------------------- Background Browser Check ----------------------- */
+async function checkBrowserAvailability(): Promise<boolean> {
   try {
-    // Basic readiness check
-    if (!isReady) {
-      console.log('Health check: Service not ready yet');
-      return res.status(503).type('text/plain').send('Service starting up...');
-    }
-    
-    const now = Date.now();
-    
-    // Use cached result if recent enough
-    if (playwrightReady && (now - lastHealthCheckTime) < HEALTH_CHECK_CACHE_DURATION) {
-      return res.status(200).type('text/plain').send('OK');
-    }
-    
-    // Perform fresh Playwright readiness test
-    console.log('Health check: Testing Playwright browser launch...');
     const timeout = getPlaywrightTimeout();
+    console.log('🔍 Testing browser availability...');
+    
     const browser = await chromium.launch({ 
       headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
-      timeout,
+      timeout: Math.min(timeout, 30000), // Cap at 30s for background checks
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -60,23 +59,37 @@ app.get('/health', async (_req, res) => {
       ]
     });
     
-    // Quick test to ensure browser is functional
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    await page.goto('data:text/html,<html><body>Health Check</body></html>');
-    await context.close();
     await browser.close();
-    
-    playwrightReady = true;
-    lastHealthCheckTime = now;
-    console.log('Health check: Playwright test passed');
-    
-    res.status(200).type('text/plain').send('OK');
+    console.log('✅ Browser availability check passed');
+    return true;
   } catch (error) {
-    console.error('Health check failed:', error);
-    playwrightReady = false;
-    res.status(503).type('text/plain').send('Service unavailable - Playwright browsers not available');
+    console.error('❌ Browser availability check failed:', error);
+    return false;
   }
+}
+
+/* ----------------------- Browser Status Endpoint ----------------------- */
+app.get('/browser-status', async (_req, res) => {
+  const now = Date.now();
+  
+  // Use cached result if recent enough
+  if ((now - lastBrowserCheckTime) < BROWSER_CHECK_CACHE_DURATION) {
+    return res.json({ 
+      ready: playwrightReady, 
+      lastChecked: new Date(lastBrowserCheckTime).toISOString(),
+      cached: true 
+    });
+  }
+  
+  // Perform fresh browser check
+  playwrightReady = await checkBrowserAvailability();
+  lastBrowserCheckTime = now;
+  
+  res.json({ 
+    ready: playwrightReady, 
+    lastChecked: new Date(lastBrowserCheckTime).toISOString(),
+    cached: false 
+  });
 });
 
 /* ------------------------------- CORS setup ------------------------------- */
@@ -162,59 +175,28 @@ interface PoliceFormData {
 async function performStartupReadinessCheck() {
   console.log('🔍 Performing startup readiness checks...');
   
-  try {
-    // Test Playwright browser launching
-    console.log('Testing Playwright browser launch capability...');
-    const timeout = getPlaywrightTimeout();
-    console.log(`Using browser timeout: ${timeout}ms`);
-    
-    const browser = await chromium.launch({ 
-      headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
-      timeout,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--disable-gpu'
-      ]
-    });
-    
-    const context = await browser.newContext();
-    const page = await context.newPage();
-    
-    // Test basic page operations
-    await page.goto('data:text/html,<html><body>Startup Test</body></html>');
-    const title = await page.title();
-    console.log(`Browser test page title: "${title}"`);
-    
-    await context.close();
-    await browser.close();
-    
-    console.log('✅ Playwright readiness check passed');
-    playwrightReady = true;
-    lastHealthCheckTime = Date.now();
-    isReady = true;
-    
-    return true;
-  } catch (error) {
-    console.error('❌ Startup readiness check failed:', error);
-    console.log('⚠️  Browser launch failed - this may indicate missing browser dependencies');
-    
-    // In production, browsers must be available - fail fast
-    if (process.env.NODE_ENV === 'production') {
-      console.log('🚨 Production mode: Browser availability is required for deployment');
-      throw new Error(`Production startup failed: ${error}`);
+  // Mark server as ready immediately - health checks should pass
+  serverReady = true;
+  
+  // Perform background browser check without blocking startup
+  setTimeout(async () => {
+    try {
+      console.log('🔍 Background browser availability check...');
+      playwrightReady = await checkBrowserAvailability();
+      lastBrowserCheckTime = Date.now();
+      
+      if (playwrightReady) {
+        console.log('✅ Browser availability verified in background');
+      } else {
+        console.log('⚠️  Browser not available - API requests will fail until browsers are ready');
+      }
+    } catch (error) {
+      console.error('❌ Background browser check failed:', error);
+      playwrightReady = false;
     }
-    
-    // In development, continue anyway but mark as not ready
-    console.log('🛠️  Development mode: continuing startup without browser verification');
-    isReady = true; // Allow basic startup
-    playwrightReady = false; // Health checks will still test browsers
-    return true;
-  }
+  }, 2000); // Start browser check 2 seconds after server startup
+  
+  return true;
 }
 
 /* ----------------------- Enhanced Browser Management ---------------------- */
@@ -331,8 +313,26 @@ app.post('/api/police/submit/tenant', async (req, res) => {
   try { assertDOB_DDMMYYYY(p.date_of_birth); }
   catch (e: any) { return res.status(400).json({ ok: false, error: e.message }); }
 
-  if (!isReady) {
-    return res.status(503).json({ ok: false, error: 'Service not ready yet, please try again' });
+  if (!serverReady) {
+    return res.status(503).json({ ok: false, error: 'Server not ready yet, please try again' });
+  }
+
+  // Check browser availability with current cache
+  const now = Date.now();
+  if ((now - lastBrowserCheckTime) >= BROWSER_CHECK_CACHE_DURATION) {
+    // Refresh browser status in background
+    setTimeout(async () => {
+      playwrightReady = await checkBrowserAvailability();
+      lastBrowserCheckTime = Date.now();
+    }, 0);
+  }
+
+  if (!playwrightReady) {
+    return res.status(503).json({ 
+      ok: false, 
+      error: 'Browser services not available yet, please try again in a moment',
+      hint: 'Check /browser-status for current browser availability'
+    });
   }
 
   console.log(`📋 Processing police form submission for: ${p.first_name} ${p.last_name}`);
@@ -551,8 +551,10 @@ async function startServer() {
     server = app.listen(port, '0.0.0.0', () => {
       console.log(`🚦 Server ready and listening on 0.0.0.0:${port}`);
       console.log(`📊 Health check: http://localhost:${port}/health`);
+      console.log(`🔍 Browser status: http://localhost:${port}/browser-status`);
       console.log(`🔗 Police form API: http://localhost:${port}/api/police/submit/tenant`);
-      console.log(`✅ Service is fully operational (ready=${isReady}, playwright=${playwrightReady})`);
+      console.log(`✅ Service is operational (server=${serverReady}, browser_check_in_progress)`);
+      console.log(`💡 Browser availability will be verified in background`);
     });
     
   } catch (error) {
