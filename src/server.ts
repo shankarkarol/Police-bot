@@ -207,23 +207,29 @@ function isOriginAllowed(origin: string | undefined): boolean {
   return false;
 }
 
-// Simplified CORS configuration using array approach for better reliability
+// Comprehensive CORS configuration with bulletproof error handling
 const corsOptions: cors.CorsOptions = {
   origin: (origin, callback) => {
     try {
+      console.log(`🔍 CORS origin check for: "${origin}"`);
+      
+      // Allow requests with no origin (same-origin, mobile apps, etc.)
+      if (!origin) {
+        console.log('✅ No origin header - allowing (same-origin request)');
+        return callback(null, true);
+      }
+      
       const allowed = isOriginAllowed(origin);
       console.log(`🔍 CORS decision for "${origin}": ${allowed ? 'ALLOWED' : 'DENIED'}`);
       
-      if (allowed) {
-        callback(null, true);
-      } else {
-        // Don't use an error - just deny with false to ensure headers are still set
-        callback(null, false);
-      }
+      // CRITICAL: Always return true/false, never use callback(error)
+      // Using callback(error) prevents CORS headers from being set
+      callback(null, allowed);
+      
     } catch (error) {
       console.error('🚨 CORS origin check error:', error);
-      // In case of error, deny access but don't crash
-      callback(null, false);
+      // On error, allow the request with wildcard to prevent complete failure
+      callback(null, true);
     }
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD'],
@@ -242,57 +248,84 @@ const corsOptions: cors.CorsOptions = {
   maxAge: 86400, // 24 hours
 };
 
-// Apply CORS middleware globally with error handling
-app.use((req, res, next) => {
-  console.log(`📍 Incoming ${req.method} ${req.path} from origin: "${req.headers.origin || 'none'}"`);
-  cors(corsOptions)(req, res, (err) => {
-    if (err) {
-      console.error('🚨 CORS middleware error:', err);
-      // Set basic CORS headers manually as fallback
-      res.header('Access-Control-Allow-Origin', '*');
-      res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
-    }
-    next(err);
-  });
-});
+// Apply CORS middleware directly without wrapper - critical for proper header setting
+app.use(cors(corsOptions));
 
-// Request logging middleware for debugging
+// Enhanced request logging middleware
 app.use((req, res, next) => {
   console.log(`📍 ${req.method} ${req.path} from origin: "${req.headers.origin || 'none'}"`);
+  next();
+});
+
+// Backup CORS middleware as safety net - ensures headers are ALWAYS set for cross-origin requests
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
   
-  // Log response headers after they're set
-  const originalSend = res.send;
-  const originalJson = res.json;
-  
-  // Override send method
-  res.send = function(body) {
-    console.log(`📤 Response headers for ${req.method} ${req.path}:`, {
-      'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
-      'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
-      'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
-      'access-control-allow-credentials': res.getHeader('access-control-allow-credentials'),
-      'status': res.statusCode
-    });
-    return originalSend.call(this, body);
-  };
-  
-  // Override json method
-  res.json = function(body) {
-    console.log(`📤 Response headers for ${req.method} ${req.path}:`, {
-      'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
-      'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
-      'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
-      'access-control-allow-credentials': res.getHeader('access-control-allow-credentials'),
-      'status': res.statusCode
-    });
-    return originalJson.call(this, body);
-  };
+  // Only apply backup headers if no CORS headers are already set and there's an origin
+  if (origin && !res.getHeader('access-control-allow-origin')) {
+    const allowed = isOriginAllowed(origin);
+    console.log(`🔧 Backup CORS middleware activated for "${origin}" - allowed: ${allowed}`);
+    
+    if (allowed) {
+      res.header('Access-Control-Allow-Origin', origin);
+      res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
+      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
+      res.header('Vary', 'Origin');
+      console.log(`✅ Backup CORS headers set for allowed origin: ${origin}`);
+    } else {
+      console.log(`❌ Backup CORS: Origin "${origin}" not allowed, no headers set`);
+    }
+  }
   
   next();
 });
 
-// Explicit preflight handling for all routes with comprehensive debugging
+// Enhanced response header logging middleware
+app.use((req, res, next) => {
+  // Capture original methods to log headers after they're set
+  const originalSend = res.send;
+  const originalJson = res.json;
+  
+  // Override send method to log headers
+  res.send = function(body) {
+    logCorsHeaders(req, res);
+    return originalSend.call(this, body);
+  };
+  
+  // Override json method to log headers
+  res.json = function(body) {
+    logCorsHeaders(req, res);
+    return originalJson.call(this, body);
+  };
+  
+  // Hook into the finish event to catch all responses
+  res.on('finish', () => {
+    logCorsHeaders(req, res);
+  });
+  
+  next();
+});
+
+// Helper function to log CORS headers consistently
+function logCorsHeaders(req: any, res: any) {
+  const corsHeaders = {
+    'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+    'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
+    'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
+    'access-control-allow-credentials': res.getHeader('access-control-allow-credentials'),
+    'access-control-max-age': res.getHeader('access-control-max-age'),
+    'vary': res.getHeader('vary')
+  };
+  
+  console.log(`📤 CORS headers for ${req.method} ${req.path} (status: ${res.statusCode}):`, corsHeaders);
+  
+  // Alert if no CORS headers are present for cross-origin requests
+  if (req.headers.origin && !corsHeaders['access-control-allow-origin']) {
+    console.error(`🚨 CRITICAL: No CORS headers set for cross-origin request from "${req.headers.origin}"`);
+  }
+}
+
+// Comprehensive preflight handling with enhanced debugging
 app.options('*', (req, res) => {
   const origin = req.headers.origin;
   console.log(`🔍 OPTIONS (preflight) request from origin: "${origin}"`);
@@ -306,19 +339,29 @@ app.options('*', (req, res) => {
   const allowed = isOriginAllowed(origin);
   console.log(`🔍 Preflight decision for "${origin}": ${allowed ? 'ALLOWED' : 'DENIED'}`);
   
-  if (allowed) {
-    res.header('Access-Control-Allow-Origin', origin || '*');
+  // Set CORS headers based on origin validation
+  if (allowed && origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else if (!origin) {
+    // No origin header means same-origin request
+    res.header('Access-Control-Allow-Origin', '*');
   }
+  // If origin is not allowed, don't set Access-Control-Allow-Origin header
+  
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
   res.header('Access-Control-Max-Age', '86400');
+  res.header('Vary', 'Origin');
   
-  console.log(`📤 Preflight response headers:`, {
+  const responseHeaders = {
     'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
     'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
     'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
-    'access-control-max-age': res.getHeader('access-control-max-age')
-  });
+    'access-control-max-age': res.getHeader('access-control-max-age'),
+    'vary': res.getHeader('vary')
+  };
+  
+  console.log(`📤 Preflight response headers:`, responseHeaders);
   
   res.status(200).end();
 });
