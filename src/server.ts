@@ -27,28 +27,6 @@ const getPlaywrightTimeout = () => {
   return envTimeout ? parseInt(envTimeout, 10) : 30000;
 };
 
-/* --------------------------- Health Checks ------------------------------ */
-app.get('/health', async (_req, res) => {
-  // Lightweight health check - just verify server is running
-  if (!serverReady) {
-    return res.status(503).type('text/plain').send('Server starting...');
-  }
-  
-  // Server is ready - always return 200 for health check
-  // Browser readiness is checked separately and cached
-  res.status(200).type('text/plain').send('OK');
-});
-
-// Add /api/health endpoint for compatibility
-app.get('/api/health', async (_req, res) => {
-  // Same as /health but under /api path
-  if (!serverReady) {
-    return res.status(503).json({ status: 'Server starting...', ready: false });
-  }
-  
-  res.status(200).json({ status: 'OK', ready: true });
-});
-
 /* ----------------------- Background Browser Check ----------------------- */
 async function checkBrowserAvailability(): Promise<boolean> {
   try {
@@ -364,6 +342,29 @@ app.options('*', (req, res) => {
   console.log(`📤 Preflight response headers:`, responseHeaders);
   
   res.status(200).end();
+});
+
+/* --------------------------- Health Checks ------------------------------ */
+// Health endpoints defined AFTER CORS middleware to ensure proper headers
+app.get('/health', async (_req, res) => {
+  // Lightweight health check - just verify server is running
+  if (!serverReady) {
+    return res.status(503).type('text/plain').send('Server starting...');
+  }
+  
+  // Server is ready - always return 200 for health check
+  // Browser readiness is checked separately and cached
+  res.status(200).type('text/plain').send('OK');
+});
+
+// Add /api/health endpoint for compatibility
+app.get('/api/health', async (_req, res) => {
+  // Same as /health but under /api path
+  if (!serverReady) {
+    return res.status(503).json({ status: 'Server starting...', ready: false });
+  }
+  
+  res.status(200).json({ status: 'OK', ready: true });
 });
 
 // Enhanced CORS test endpoint with detailed debugging
