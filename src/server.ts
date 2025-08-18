@@ -134,11 +134,12 @@ const staticAllow = [
   'https://railway.com',
 ];
 
-// Parse environment origins and handle wildcard patterns
+// Parse environment origins with robust cleaning
 const envAllow = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
-  .map(s => s.trim()) // This should handle spaces
-  .filter(Boolean);
+  .map(s => s.trim())
+  .filter(Boolean)
+  .filter(s => s.length > 0); // Extra filtering to remove empty strings
 
 const ALLOWLIST = Array.from(new Set([...staticAllow, ...envAllow]));
 
@@ -146,28 +147,37 @@ console.log('🔧 CORS Configuration:');
 console.log('📋 Static Origins:', staticAllow);
 console.log('📋 Environment Origins:', envAllow);
 console.log('📋 Combined Allowed Origins:', ALLOWLIST);
+console.log('📋 Environment variable value:', JSON.stringify(process.env.ALLOWED_ORIGINS));
 
+// Enhanced CORS configuration with more reliable handling
 const corsOptions: cors.CorsOptions = {
   origin: (origin, cb) => {
-    console.log(`🔍 CORS check for origin: ${origin}`);
+    console.log(`🔍 CORS check for origin: "${origin}"`);
     console.log(`📋 Current allowlist: ${JSON.stringify(ALLOWLIST)}`);
     
-    // Allow requests with no origin (same-origin, mobile apps, etc.)
+    // Allow requests with no origin (same-origin, mobile apps, Postman, etc.)
     if (!origin) {
-      console.log('✅ No origin - allowing');
+      console.log('✅ No origin - allowing (same-origin or non-browser request)');
       return cb(null, true);
     }
     
-    // Check direct match
-    if (ALLOWLIST.includes(origin)) {
-      console.log(`✅ Origin ${origin} found in allowlist`);
+    // Check direct match with case sensitivity
+    const matchFound = ALLOWLIST.some(allowed => {
+      const matches = allowed === origin;
+      if (matches) {
+        console.log(`✅ Direct match found: "${origin}" === "${allowed}"`);
+      }
+      return matches;
+    });
+    
+    if (matchFound) {
       return cb(null, true);
     }
     
-    // Check wildcard patterns (handle both *.domain.com and https://*.domain.com)
+    // Check wildcard patterns
     for (const allowed of ALLOWLIST) {
       if (allowed.includes('*')) {
-        console.log(`🔍 Checking wildcard pattern: ${allowed}`);
+        console.log(`🔍 Checking wildcard pattern: "${allowed}"`);
         
         // Extract the pattern part after *
         let pattern: string;
@@ -180,39 +190,82 @@ const corsOptions: cors.CorsOptions = {
           pattern = allowed.slice(1); // remove * from *.domain.com
         }
         
-        console.log(`🔍 Extracted pattern: ${pattern}`);
-        console.log(`🔍 Checking if ${origin} ends with ${pattern}`);
+        console.log(`🔍 Extracted pattern: "${pattern}"`);
+        console.log(`🔍 Checking if "${origin}" ends with "${pattern}"`);
         
         if (origin.endsWith(pattern)) {
-          console.log(`✅ Origin ${origin} matches wildcard pattern ${allowed}`);
+          console.log(`✅ Origin "${origin}" matches wildcard pattern "${allowed}"`);
           return cb(null, true);
         }
       }
     }
     
-    console.log(`❌ Origin ${origin} not allowed - denying request`);
-    // Use cb(null, false) instead of cb(new Error(...)) for better CORS handling
+    console.log(`❌ Origin "${origin}" not allowed - access denied`);
+    console.log(`❌ Available origins: ${JSON.stringify(ALLOWLIST)}`);
+    
+    // Return false to deny access but still allow CORS headers to be set
     return cb(null, false);
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   credentials: false,
-  optionsSuccessStatus: 200, // Change from 204 to 200 for better compatibility
+  optionsSuccessStatus: 200,
   preflightContinue: false,
-  maxAge: 600,
+  maxAge: 86400, // 24 hours
 };
 
-// Apply CORS middleware
+// Apply CORS middleware globally
 app.use(cors(corsOptions));
 
-// Explicitly handle preflight requests
-app.options('*', cors(corsOptions));
+// Request logging middleware for debugging
+app.use((req, res, next) => {
+  console.log(`📍 ${req.method} ${req.path} from origin: "${req.headers.origin || 'none'}"`);
+  
+  // Log response headers after they're set
+  const originalSend = res.send;
+  res.send = function(body) {
+    console.log(`📤 Response headers for ${req.path}:`, {
+      'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+      'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
+      'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
+    });
+    return originalSend.call(this, body);
+  };
+  
+  next();
+});
 
-// Add a simple CORS test endpoint
+// Explicit preflight handling for all routes
+app.options('*', (req, res) => {
+  console.log(`🔍 OPTIONS request from origin: "${req.headers.origin}"`);
+  cors(corsOptions)(req, res, () => {
+    res.status(200).end();
+  });
+});
+
+// Enhanced CORS test endpoint with detailed debugging
 app.get('/api/cors-test', (req, res) => {
+  const origin = req.headers.origin;
+  const userAgent = req.headers['user-agent'];
+  
   res.json({ 
     message: 'CORS test successful',
-    origin: req.headers.origin,
+    origin: origin,
+    corsHeaders: {
+      'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+      'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
+      'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
+    },
+    requestHeaders: {
+      origin: origin,
+      userAgent: userAgent,
+      referer: req.headers.referer,
+    },
+    allowlist: ALLOWLIST,
+    env: {
+      ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
+      NODE_ENV: process.env.NODE_ENV,
+    },
     timestamp: new Date().toISOString()
   });
 });
