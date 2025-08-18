@@ -39,6 +39,16 @@ app.get('/health', async (_req, res) => {
   res.status(200).type('text/plain').send('OK');
 });
 
+// Add /api/health endpoint for compatibility
+app.get('/api/health', async (_req, res) => {
+  // Same as /health but under /api path
+  if (!serverReady) {
+    return res.status(503).json({ status: 'Server starting...', ready: false });
+  }
+  
+  res.status(200).json({ status: 'OK', ready: true });
+});
+
 /* ----------------------- Background Browser Check ----------------------- */
 async function checkBrowserAvailability(): Promise<boolean> {
   try {
@@ -92,13 +102,39 @@ app.get('/browser-status', async (_req, res) => {
   });
 });
 
+// Add /api/browser-status endpoint for consistency
+app.get('/api/browser-status', async (_req, res) => {
+  const now = Date.now();
+  
+  // Use cached result if recent enough
+  if ((now - lastBrowserCheckTime) < BROWSER_CHECK_CACHE_DURATION) {
+    return res.json({ 
+      ready: playwrightReady, 
+      lastChecked: new Date(lastBrowserCheckTime).toISOString(),
+      cached: true 
+    });
+  }
+  
+  // Perform fresh browser check
+  playwrightReady = await checkBrowserAvailability();
+  lastBrowserCheckTime = now;
+  
+  res.json({ 
+    ready: playwrightReady, 
+    lastChecked: new Date(lastBrowserCheckTime).toISOString(),
+    cached: false 
+  });
+});
+
 /* ------------------------------- CORS setup ------------------------------- */
 /** Static allowlist + env (comma-separated) */
 const staticAllow = [
   'https://hostel-hub-tenant-ma-production.up.railway.app',
   'https://anandpg.netlify.app',
-  'https://railway.com', // ✅ added as requested
+  'https://railway.com',
 ];
+
+// Parse environment origins and handle wildcard patterns
 const envAllow = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -106,19 +142,48 @@ const envAllow = (process.env.ALLOWED_ORIGINS || '')
 
 const ALLOWLIST = Array.from(new Set([...staticAllow, ...envAllow]));
 
+console.log('🔧 CORS Configuration:');
+console.log('📋 Allowed Origins:', ALLOWLIST);
+
 const corsOptions: cors.CorsOptions = {
   origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // health checks / curl / server-to-server
-    if (ALLOWLIST.includes(origin)) return cb(null, true);
-    // optional wildcard: allow patterns like *.railway.app
-    if (ALLOWLIST.some(p => p.startsWith('*.') && origin.endsWith(p.slice(1)))) {
+    console.log(`🔍 CORS check for origin: ${origin}`);
+    
+    // Allow requests with no origin (same-origin, mobile apps, etc.)
+    if (!origin) {
+      console.log('✅ No origin - allowing');
       return cb(null, true);
     }
+    
+    // Check direct match
+    if (ALLOWLIST.includes(origin)) {
+      console.log(`✅ Origin ${origin} found in allowlist`);
+      return cb(null, true);
+    }
+    
+    // Check wildcard patterns (handle both *.domain.com and https://*.domain.com)
+    for (const allowed of ALLOWLIST) {
+      if (allowed.includes('*')) {
+        // Extract the pattern part after *
+        const pattern = allowed.includes('://') 
+          ? allowed.split('://')[1].slice(1) // remove * from https://*.domain.com
+          : allowed.slice(1); // remove * from *.domain.com
+        
+        if (origin.endsWith(pattern)) {
+          console.log(`✅ Origin ${origin} matches wildcard pattern ${allowed}`);
+          return cb(null, true);
+        }
+      }
+    }
+    
+    console.log(`❌ Origin ${origin} not allowed`);
     return cb(new Error(`CORS: Origin ${origin} not allowed`));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: false,
+  optionsSuccessStatus: 204, // Some legacy browsers choke on 204
+  preflightContinue: false,
   maxAge: 600,
 };
 
@@ -551,7 +616,9 @@ async function startServer() {
     server = app.listen(port, '0.0.0.0', () => {
       console.log(`🚦 Server ready and listening on 0.0.0.0:${port}`);
       console.log(`📊 Health check: http://localhost:${port}/health`);
+      console.log(`📊 API Health check: http://localhost:${port}/api/health`);
       console.log(`🔍 Browser status: http://localhost:${port}/browser-status`);
+      console.log(`🔍 API Browser status: http://localhost:${port}/api/browser-status`);
       console.log(`🔗 Police form API: http://localhost:${port}/api/police/submit/tenant`);
       console.log(`✅ Service is operational (server=${serverReady}, browser_check_in_progress)`);
       console.log(`💡 Browser availability will be verified in background`);
