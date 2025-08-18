@@ -149,73 +149,113 @@ console.log('📋 Environment Origins:', envAllow);
 console.log('📋 Combined Allowed Origins:', ALLOWLIST);
 console.log('📋 Environment variable value:', JSON.stringify(process.env.ALLOWED_ORIGINS));
 
-// Enhanced CORS configuration with more reliable handling
-const corsOptions: cors.CorsOptions = {
-  origin: (origin, cb) => {
-    console.log(`🔍 CORS check for origin: "${origin}"`);
-    console.log(`📋 Current allowlist: ${JSON.stringify(ALLOWLIST)}`);
-    
-    // Allow requests with no origin (same-origin, mobile apps, Postman, etc.)
-    if (!origin) {
-      console.log('✅ No origin - allowing (same-origin or non-browser request)');
-      return cb(null, true);
+// Function to check if origin is allowed
+function isOriginAllowed(origin: string | undefined): boolean {
+  if (!origin) {
+    console.log('✅ No origin - allowing (same-origin or non-browser request)');
+    return true;
+  }
+
+  console.log(`🔍 CORS check for origin: "${origin}"`);
+  console.log(`📋 Current allowlist: ${JSON.stringify(ALLOWLIST)}`);
+  
+  // Check direct match with case sensitivity
+  const directMatch = ALLOWLIST.some(allowed => {
+    const matches = allowed === origin;
+    if (matches) {
+      console.log(`✅ Direct match found: "${origin}" === "${allowed}"`);
     }
-    
-    // Check direct match with case sensitivity
-    const matchFound = ALLOWLIST.some(allowed => {
-      const matches = allowed === origin;
-      if (matches) {
-        console.log(`✅ Direct match found: "${origin}" === "${allowed}"`);
-      }
-      return matches;
-    });
-    
-    if (matchFound) {
-      return cb(null, true);
-    }
-    
-    // Check wildcard patterns
-    for (const allowed of ALLOWLIST) {
-      if (allowed.includes('*')) {
-        console.log(`🔍 Checking wildcard pattern: "${allowed}"`);
-        
-        // Extract the pattern part after *
-        let pattern: string;
-        if (allowed.includes('://')) {
-          // https://*.domain.com -> .domain.com
-          const parts = allowed.split('://');
+    return matches;
+  });
+  
+  if (directMatch) {
+    return true;
+  }
+  
+  // Check wildcard patterns
+  for (const allowed of ALLOWLIST) {
+    if (allowed.includes('*')) {
+      console.log(`🔍 Checking wildcard pattern: "${allowed}"`);
+      
+      // Extract the pattern part after *
+      let pattern: string;
+      if (allowed.includes('://')) {
+        // https://*.domain.com -> .domain.com
+        const parts = allowed.split('://');
+        if (parts[1] && parts[1].startsWith('*')) {
           pattern = parts[1].slice(1); // remove * from *.domain.com
         } else {
-          // *.domain.com -> .domain.com  
-          pattern = allowed.slice(1); // remove * from *.domain.com
+          continue;
         }
-        
-        console.log(`🔍 Extracted pattern: "${pattern}"`);
-        console.log(`🔍 Checking if "${origin}" ends with "${pattern}"`);
-        
-        if (origin.endsWith(pattern)) {
-          console.log(`✅ Origin "${origin}" matches wildcard pattern "${allowed}"`);
-          return cb(null, true);
-        }
+      } else {
+        // *.domain.com -> .domain.com  
+        pattern = allowed.slice(1); // remove * from *.domain.com
+      }
+      
+      console.log(`🔍 Extracted pattern: "${pattern}"`);
+      console.log(`🔍 Checking if "${origin}" ends with "${pattern}"`);
+      
+      if (origin.endsWith(pattern)) {
+        console.log(`✅ Origin "${origin}" matches wildcard pattern "${allowed}"`);
+        return true;
       }
     }
-    
-    console.log(`❌ Origin "${origin}" not allowed - access denied`);
-    console.log(`❌ Available origins: ${JSON.stringify(ALLOWLIST)}`);
-    
-    // Return false to deny access but still allow CORS headers to be set
-    return cb(null, false);
+  }
+  
+  console.log(`❌ Origin "${origin}" not allowed - access denied`);
+  console.log(`❌ Available origins: ${JSON.stringify(ALLOWLIST)}`);
+  return false;
+}
+
+// Simplified CORS configuration using array approach for better reliability
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, callback) => {
+    try {
+      const allowed = isOriginAllowed(origin);
+      console.log(`🔍 CORS decision for "${origin}": ${allowed ? 'ALLOWED' : 'DENIED'}`);
+      
+      if (allowed) {
+        callback(null, true);
+      } else {
+        // Don't use an error - just deny with false to ensure headers are still set
+        callback(null, false);
+      }
+    } catch (error) {
+      console.error('🚨 CORS origin check error:', error);
+      // In case of error, deny access but don't crash
+      callback(null, false);
+    }
   },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD'],
+  allowedHeaders: [
+    'Content-Type', 
+    'Authorization', 
+    'X-Requested-With', 
+    'Accept',
+    'Origin',
+    'Access-Control-Request-Method',
+    'Access-Control-Request-Headers'
+  ],
   credentials: false,
   optionsSuccessStatus: 200,
   preflightContinue: false,
   maxAge: 86400, // 24 hours
 };
 
-// Apply CORS middleware globally
-app.use(cors(corsOptions));
+// Apply CORS middleware globally with error handling
+app.use((req, res, next) => {
+  console.log(`📍 Incoming ${req.method} ${req.path} from origin: "${req.headers.origin || 'none'}"`);
+  cors(corsOptions)(req, res, (err) => {
+    if (err) {
+      console.error('🚨 CORS middleware error:', err);
+      // Set basic CORS headers manually as fallback
+      res.header('Access-Control-Allow-Origin', '*');
+      res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    }
+    next(err);
+  });
+});
 
 // Request logging middleware for debugging
 app.use((req, res, next) => {
@@ -223,50 +263,108 @@ app.use((req, res, next) => {
   
   // Log response headers after they're set
   const originalSend = res.send;
+  const originalJson = res.json;
+  
+  // Override send method
   res.send = function(body) {
-    console.log(`📤 Response headers for ${req.path}:`, {
+    console.log(`📤 Response headers for ${req.method} ${req.path}:`, {
       'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
       'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
       'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
+      'access-control-allow-credentials': res.getHeader('access-control-allow-credentials'),
+      'status': res.statusCode
     });
     return originalSend.call(this, body);
+  };
+  
+  // Override json method
+  res.json = function(body) {
+    console.log(`📤 Response headers for ${req.method} ${req.path}:`, {
+      'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+      'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
+      'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
+      'access-control-allow-credentials': res.getHeader('access-control-allow-credentials'),
+      'status': res.statusCode
+    });
+    return originalJson.call(this, body);
   };
   
   next();
 });
 
-// Explicit preflight handling for all routes
+// Explicit preflight handling for all routes with comprehensive debugging
 app.options('*', (req, res) => {
-  console.log(`🔍 OPTIONS request from origin: "${req.headers.origin}"`);
-  cors(corsOptions)(req, res, () => {
-    res.status(200).end();
+  const origin = req.headers.origin;
+  console.log(`🔍 OPTIONS (preflight) request from origin: "${origin}"`);
+  console.log(`🔍 Request headers:`, {
+    'origin': origin,
+    'access-control-request-method': req.headers['access-control-request-method'],
+    'access-control-request-headers': req.headers['access-control-request-headers'],
+    'user-agent': req.headers['user-agent']
   });
+  
+  const allowed = isOriginAllowed(origin);
+  console.log(`🔍 Preflight decision for "${origin}": ${allowed ? 'ALLOWED' : 'DENIED'}`);
+  
+  if (allowed) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+  }
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
+  res.header('Access-Control-Max-Age', '86400');
+  
+  console.log(`📤 Preflight response headers:`, {
+    'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+    'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
+    'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
+    'access-control-max-age': res.getHeader('access-control-max-age')
+  });
+  
+  res.status(200).end();
 });
 
 // Enhanced CORS test endpoint with detailed debugging
 app.get('/api/cors-test', (req, res) => {
   const origin = req.headers.origin;
   const userAgent = req.headers['user-agent'];
+  const allowed = isOriginAllowed(origin);
+  
+  console.log(`🔍 CORS test request from origin: "${origin}", allowed: ${allowed}`);
   
   res.json({ 
     message: 'CORS test successful',
+    timestamp: new Date().toISOString(),
     origin: origin,
+    originAllowed: allowed,
     corsHeaders: {
       'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
       'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
       'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
+      'access-control-allow-credentials': res.getHeader('access-control-allow-credentials'),
+      'access-control-max-age': res.getHeader('access-control-max-age')
     },
     requestHeaders: {
       origin: origin,
       userAgent: userAgent,
       referer: req.headers.referer,
+      host: req.headers.host,
+      'access-control-request-method': req.headers['access-control-request-method'],
+      'access-control-request-headers': req.headers['access-control-request-headers']
     },
-    allowlist: ALLOWLIST,
-    env: {
-      ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
-      NODE_ENV: process.env.NODE_ENV,
+    configuration: {
+      allowlist: ALLOWLIST,
+      staticOrigins: staticAllow,
+      envOrigins: envAllow,
+      env: {
+        ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
+        NODE_ENV: process.env.NODE_ENV,
+      }
     },
-    timestamp: new Date().toISOString()
+    serverInfo: {
+      serverReady: serverReady,
+      playwrightReady: playwrightReady,
+      lastBrowserCheck: lastBrowserCheckTime ? new Date(lastBrowserCheckTime).toISOString() : null
+    }
   });
 });
 
