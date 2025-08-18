@@ -18,31 +18,64 @@ process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:
 /* --------------------------- Readiness State ---------------------------- */
 let isReady = false;
 let playwrightReady = false;
+let lastHealthCheckTime = 0;
+const HEALTH_CHECK_CACHE_DURATION = 30000; // Cache health check result for 30 seconds
+
+// Get timeout from environment or default
+const getPlaywrightTimeout = () => {
+  const envTimeout = process.env.PLAYWRIGHT_TIMEOUT;
+  return envTimeout ? parseInt(envTimeout, 10) : 30000;
+};
 
 /* --------------------------- Health Checks ------------------------------ */
 app.get('/health', async (_req, res) => {
   try {
     // Basic readiness check
     if (!isReady) {
+      console.log('Health check: Service not ready yet');
       return res.status(503).type('text/plain').send('Service starting up...');
     }
     
-    // Advanced health check - verify Playwright can launch browsers
-    if (!playwrightReady) {
-      console.log('Health check: Testing Playwright readiness...');
-      const browser = await chromium.launch({ 
-        headless: true,
-        timeout: 10000 // 10 second timeout for health checks
-      });
-      await browser.close();
-      playwrightReady = true;
-      console.log('Health check: Playwright test passed');
+    const now = Date.now();
+    
+    // Use cached result if recent enough
+    if (playwrightReady && (now - lastHealthCheckTime) < HEALTH_CHECK_CACHE_DURATION) {
+      return res.status(200).type('text/plain').send('OK');
     }
+    
+    // Perform fresh Playwright readiness test
+    console.log('Health check: Testing Playwright browser launch...');
+    const timeout = getPlaywrightTimeout();
+    const browser = await chromium.launch({ 
+      headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
+      timeout,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu'
+      ]
+    });
+    
+    // Quick test to ensure browser is functional
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.goto('data:text/html,<html><body>Health Check</body></html>');
+    await context.close();
+    await browser.close();
+    
+    playwrightReady = true;
+    lastHealthCheckTime = now;
+    console.log('Health check: Playwright test passed');
     
     res.status(200).type('text/plain').send('OK');
   } catch (error) {
     console.error('Health check failed:', error);
-    res.status(503).type('text/plain').send('Service unavailable');
+    playwrightReady = false;
+    res.status(503).type('text/plain').send('Service unavailable - Playwright browsers not available');
   }
 });
 
@@ -132,52 +165,68 @@ async function performStartupReadinessCheck() {
   try {
     // Test Playwright browser launching
     console.log('Testing Playwright browser launch capability...');
+    const timeout = getPlaywrightTimeout();
+    console.log(`Using browser timeout: ${timeout}ms`);
+    
     const browser = await chromium.launch({ 
-      headless: true,
-      timeout: 15000 // 15 second timeout for startup
+      headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
+      timeout,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu'
+      ]
     });
     
     const context = await browser.newContext();
     const page = await context.newPage();
     
     // Test basic page operations
-    await page.goto('data:text/html,<html><body>Test</body></html>');
+    await page.goto('data:text/html,<html><body>Startup Test</body></html>');
     const title = await page.title();
+    console.log(`Browser test page title: "${title}"`);
     
     await context.close();
     await browser.close();
     
     console.log('✅ Playwright readiness check passed');
     playwrightReady = true;
+    lastHealthCheckTime = Date.now();
     isReady = true;
     
     return true;
   } catch (error) {
     console.error('❌ Startup readiness check failed:', error);
-    console.log('⚠️  This may be expected in development environments without browsers installed');
-    console.log('📝 In production Docker containers, browsers should be pre-installed');
+    console.log('⚠️  Browser launch failed - this may indicate missing browser dependencies');
     
-    // In development, continue anyway but mark as not ready
-    // This allows the service to start for development purposes
-    if (process.env.NODE_ENV !== 'production') {
-      console.log('🛠️  Development mode: continuing startup without browser verification');
-      isReady = true; // Allow basic startup
-      // Don't set playwrightReady = true, so health checks will still test browsers
-      return true;
+    // In production, browsers must be available - fail fast
+    if (process.env.NODE_ENV === 'production') {
+      console.log('🚨 Production mode: Browser availability is required for deployment');
+      throw new Error(`Production startup failed: ${error}`);
     }
     
-    throw error;
+    // In development, continue anyway but mark as not ready
+    console.log('🛠️  Development mode: continuing startup without browser verification');
+    isReady = true; // Allow basic startup
+    playwrightReady = false; // Health checks will still test browsers
+    return true;
   }
 }
 
 /* ----------------------- Enhanced Browser Management ---------------------- */
-async function launchBrowserWithRetry(maxRetries = 3, timeout = 30000): Promise<any> {
+async function launchBrowserWithRetry(maxRetries = 3): Promise<any> {
+  const timeout = getPlaywrightTimeout();
+  
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      console.log(`Attempting to launch browser (attempt ${attempt}/${maxRetries})...`);
+      console.log(`Attempting to launch browser (attempt ${attempt}/${maxRetries}) with ${timeout}ms timeout...`);
       
       const browser = await chromium.launch({ 
-        headless: true,
+        headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
         timeout,
         args: [
           '--no-sandbox',
@@ -199,8 +248,10 @@ async function launchBrowserWithRetry(maxRetries = 3, timeout = 30000): Promise<
         throw new Error(`Failed to launch browser after ${maxRetries} attempts: ${error}`);
       }
       
-      // Wait before retry
-      await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
+      // Wait before retry with exponential backoff
+      const delay = 2000 * Math.pow(2, attempt - 1);
+      console.log(`⏳ Waiting ${delay}ms before retry...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
 }
@@ -488,6 +539,10 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 async function startServer() {
   try {
     console.log('🚀 Starting Police Form Automation Service...');
+    console.log(`📊 Environment: NODE_ENV=${process.env.NODE_ENV}`);
+    console.log(`📊 Playwright Headless: ${process.env.PLAYWRIGHT_HEADLESS !== 'false'}`);
+    console.log(`📊 Playwright Timeout: ${getPlaywrightTimeout()}ms`);
+    console.log(`📊 Port: ${port}`);
     
     // Perform startup readiness checks
     await performStartupReadinessCheck();
@@ -497,11 +552,12 @@ async function startServer() {
       console.log(`🚦 Server ready and listening on 0.0.0.0:${port}`);
       console.log(`📊 Health check: http://localhost:${port}/health`);
       console.log(`🔗 Police form API: http://localhost:${port}/api/police/submit/tenant`);
-      console.log('✅ Service is fully operational');
+      console.log(`✅ Service is fully operational (ready=${isReady}, playwright=${playwrightReady})`);
     });
     
   } catch (error) {
     console.error('❌ Failed to start server:', error);
+    console.error('💡 This is likely due to Playwright browser unavailability in production');
     process.exit(1);
   }
 }
