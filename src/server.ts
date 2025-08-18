@@ -15,41 +15,402 @@ const app = express();
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 process.on('unhandledRejection', (reason) => console.error('Unhandled Rejection:', reason));
 
-/* ------------------------------ health FIRST ------------------------------ */
-app.get('/health', (_req, res) => res.status(200).type('text/plain').send('OK'));
+/* --------------------------- Readiness State ---------------------------- */
+let serverReady = false;
+let playwrightReady = false;
+let lastBrowserCheckTime = 0;
+const BROWSER_CHECK_CACHE_DURATION = 120000; // Cache browser check result for 2 minutes
+
+// Get timeout from environment or default
+const getPlaywrightTimeout = () => {
+  const envTimeout = process.env.PLAYWRIGHT_TIMEOUT;
+  return envTimeout ? parseInt(envTimeout, 10) : 30000;
+};
+
+/* ----------------------- Background Browser Check ----------------------- */
+async function checkBrowserAvailability(): Promise<boolean> {
+  try {
+    const timeout = getPlaywrightTimeout();
+    console.log('🔍 Testing browser availability...');
+    
+    const browser = await chromium.launch({ 
+      headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
+      timeout: Math.min(timeout, 30000), // Cap at 30s for background checks
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu'
+      ]
+    });
+    
+    await browser.close();
+    console.log('✅ Browser availability check passed');
+    return true;
+  } catch (error) {
+    console.error('❌ Browser availability check failed:', error);
+    return false;
+  }
+}
+
+/* ----------------------- Browser Status Endpoint ----------------------- */
+app.get('/browser-status', async (_req, res) => {
+  const now = Date.now();
+  
+  // Use cached result if recent enough
+  if ((now - lastBrowserCheckTime) < BROWSER_CHECK_CACHE_DURATION) {
+    return res.json({ 
+      ready: playwrightReady, 
+      lastChecked: new Date(lastBrowserCheckTime).toISOString(),
+      cached: true 
+    });
+  }
+  
+  // Perform fresh browser check
+  playwrightReady = await checkBrowserAvailability();
+  lastBrowserCheckTime = now;
+  
+  res.json({ 
+    ready: playwrightReady, 
+    lastChecked: new Date(lastBrowserCheckTime).toISOString(),
+    cached: false 
+  });
+});
+
+// Add /api/browser-status endpoint for consistency
+app.get('/api/browser-status', async (_req, res) => {
+  const now = Date.now();
+  
+  // Use cached result if recent enough
+  if ((now - lastBrowserCheckTime) < BROWSER_CHECK_CACHE_DURATION) {
+    return res.json({ 
+      ready: playwrightReady, 
+      lastChecked: new Date(lastBrowserCheckTime).toISOString(),
+      cached: true 
+    });
+  }
+  
+  // Perform fresh browser check
+  playwrightReady = await checkBrowserAvailability();
+  lastBrowserCheckTime = now;
+  
+  res.json({ 
+    ready: playwrightReady, 
+    lastChecked: new Date(lastBrowserCheckTime).toISOString(),
+    cached: false 
+  });
+});
 
 /* ------------------------------- CORS setup ------------------------------- */
 /** Static allowlist + env (comma-separated) */
 const staticAllow = [
   'https://hostel-hub-tenant-ma-production.up.railway.app',
   'https://anandpg.netlify.app',
-  'https://railway.com', // ✅ added as requested
+  'https://railway.com',
 ];
+
+// Parse environment origins with robust cleaning
 const envAllow = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
-  .filter(Boolean);
+  .filter(Boolean)
+  .filter(s => s.length > 0); // Extra filtering to remove empty strings
 
 const ALLOWLIST = Array.from(new Set([...staticAllow, ...envAllow]));
 
-const corsOptions: cors.CorsOptions = {
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true); // health checks / curl / server-to-server
-    if (ALLOWLIST.includes(origin)) return cb(null, true);
-    // optional wildcard: allow patterns like *.railway.app
-    if (ALLOWLIST.some(p => p.startsWith('*.') && origin.endsWith(p.slice(1)))) {
-      return cb(null, true);
+console.log('🔧 CORS Configuration:');
+console.log('📋 Static Origins:', staticAllow);
+console.log('📋 Environment Origins:', envAllow);
+console.log('📋 Combined Allowed Origins:', ALLOWLIST);
+console.log('📋 Environment variable value:', JSON.stringify(process.env.ALLOWED_ORIGINS));
+
+// Function to check if origin is allowed
+function isOriginAllowed(origin: string | undefined): boolean {
+  if (!origin) {
+    console.log('✅ No origin - allowing (same-origin or non-browser request)');
+    return true;
+  }
+
+  console.log(`🔍 CORS check for origin: "${origin}"`);
+  console.log(`📋 Current allowlist: ${JSON.stringify(ALLOWLIST)}`);
+  
+  // Check direct match with case sensitivity
+  const directMatch = ALLOWLIST.some(allowed => {
+    const matches = allowed === origin;
+    if (matches) {
+      console.log(`✅ Direct match found: "${origin}" === "${allowed}"`);
     }
-    return cb(new Error(`CORS: Origin ${origin} not allowed`));
+    return matches;
+  });
+  
+  if (directMatch) {
+    return true;
+  }
+  
+  // Check wildcard patterns
+  for (const allowed of ALLOWLIST) {
+    if (allowed.includes('*')) {
+      console.log(`🔍 Checking wildcard pattern: "${allowed}"`);
+      
+      // Extract the pattern part after *
+      let pattern: string;
+      if (allowed.includes('://')) {
+        // https://*.domain.com -> .domain.com
+        const parts = allowed.split('://');
+        if (parts[1] && parts[1].startsWith('*')) {
+          pattern = parts[1].slice(1); // remove * from *.domain.com
+        } else {
+          continue;
+        }
+      } else {
+        // *.domain.com -> .domain.com  
+        pattern = allowed.slice(1); // remove * from *.domain.com
+      }
+      
+      console.log(`🔍 Extracted pattern: "${pattern}"`);
+      console.log(`🔍 Checking if "${origin}" ends with "${pattern}"`);
+      
+      if (origin.endsWith(pattern)) {
+        console.log(`✅ Origin "${origin}" matches wildcard pattern "${allowed}"`);
+        return true;
+      }
+    }
+  }
+  
+  console.log(`❌ Origin "${origin}" not allowed - access denied`);
+  console.log(`❌ Available origins: ${JSON.stringify(ALLOWLIST)}`);
+  return false;
+}
+
+// Comprehensive CORS configuration with bulletproof error handling
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, callback) => {
+    try {
+      console.log(`🔍 CORS origin check for: "${origin}"`);
+      
+      // Allow requests with no origin (same-origin, mobile apps, etc.)
+      if (!origin) {
+        console.log('✅ No origin header - allowing (same-origin request)');
+        return callback(null, true);
+      }
+      
+      const allowed = isOriginAllowed(origin);
+      console.log(`🔍 CORS decision for "${origin}": ${allowed ? 'ALLOWED' : 'DENIED'}`);
+      
+      // CRITICAL: Always return true/false, never use callback(error)
+      // Using callback(error) prevents CORS headers from being set
+      callback(null, allowed);
+      
+    } catch (error) {
+      console.error('🚨 CORS origin check error:', error);
+      // On error, allow the request with wildcard to prevent complete failure
+      callback(null, true);
+    }
   },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD'],
+  allowedHeaders: [
+    'Content-Type', 
+    'Authorization', 
+    'X-Requested-With', 
+    'Accept',
+    'Origin',
+    'Access-Control-Request-Method',
+    'Access-Control-Request-Headers'
+  ],
   credentials: false,
-  maxAge: 600,
+  optionsSuccessStatus: 200,
+  preflightContinue: false,
+  maxAge: 86400, // 24 hours
 };
 
+// Apply CORS middleware directly without wrapper - critical for proper header setting
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+
+// Enhanced request logging middleware
+app.use((req, res, next) => {
+  console.log(`📍 ${req.method} ${req.path} from origin: "${req.headers.origin || 'none'}"`);
+  next();
+});
+
+// Backup CORS middleware as safety net - ensures headers are ALWAYS set for cross-origin requests
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  
+  // Only apply backup headers if no CORS headers are already set and there's an origin
+  if (origin && !res.getHeader('access-control-allow-origin')) {
+    const allowed = isOriginAllowed(origin);
+    console.log(`🔧 Backup CORS middleware activated for "${origin}" - allowed: ${allowed}`);
+    
+    if (allowed) {
+      res.header('Access-Control-Allow-Origin', origin);
+      res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
+      res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
+      res.header('Vary', 'Origin');
+      console.log(`✅ Backup CORS headers set for allowed origin: ${origin}`);
+    } else {
+      console.log(`❌ Backup CORS: Origin "${origin}" not allowed, no headers set`);
+    }
+  }
+  
+  next();
+});
+
+// Enhanced response header logging middleware
+app.use((req, res, next) => {
+  // Capture original methods to log headers after they're set
+  const originalSend = res.send;
+  const originalJson = res.json;
+  
+  // Override send method to log headers
+  res.send = function(body) {
+    logCorsHeaders(req, res);
+    return originalSend.call(this, body);
+  };
+  
+  // Override json method to log headers
+  res.json = function(body) {
+    logCorsHeaders(req, res);
+    return originalJson.call(this, body);
+  };
+  
+  // Hook into the finish event to catch all responses
+  res.on('finish', () => {
+    logCorsHeaders(req, res);
+  });
+  
+  next();
+});
+
+// Helper function to log CORS headers consistently
+function logCorsHeaders(req: any, res: any) {
+  const corsHeaders = {
+    'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+    'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
+    'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
+    'access-control-allow-credentials': res.getHeader('access-control-allow-credentials'),
+    'access-control-max-age': res.getHeader('access-control-max-age'),
+    'vary': res.getHeader('vary')
+  };
+  
+  console.log(`📤 CORS headers for ${req.method} ${req.path} (status: ${res.statusCode}):`, corsHeaders);
+  
+  // Alert if no CORS headers are present for cross-origin requests
+  if (req.headers.origin && !corsHeaders['access-control-allow-origin']) {
+    console.error(`🚨 CRITICAL: No CORS headers set for cross-origin request from "${req.headers.origin}"`);
+  }
+}
+
+// Comprehensive preflight handling with enhanced debugging
+app.options('*', (req, res) => {
+  const origin = req.headers.origin;
+  console.log(`🔍 OPTIONS (preflight) request from origin: "${origin}"`);
+  console.log(`🔍 Request headers:`, {
+    'origin': origin,
+    'access-control-request-method': req.headers['access-control-request-method'],
+    'access-control-request-headers': req.headers['access-control-request-headers'],
+    'user-agent': req.headers['user-agent']
+  });
+  
+  const allowed = isOriginAllowed(origin);
+  console.log(`🔍 Preflight decision for "${origin}": ${allowed ? 'ALLOWED' : 'DENIED'}`);
+  
+  // Set CORS headers based on origin validation
+  if (allowed && origin) {
+    res.header('Access-Control-Allow-Origin', origin);
+  } else if (!origin) {
+    // No origin header means same-origin request
+    res.header('Access-Control-Allow-Origin', '*');
+  }
+  // If origin is not allowed, don't set Access-Control-Allow-Origin header
+  
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin, Access-Control-Request-Method, Access-Control-Request-Headers');
+  res.header('Access-Control-Max-Age', '86400');
+  res.header('Vary', 'Origin');
+  
+  const responseHeaders = {
+    'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+    'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
+    'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
+    'access-control-max-age': res.getHeader('access-control-max-age'),
+    'vary': res.getHeader('vary')
+  };
+  
+  console.log(`📤 Preflight response headers:`, responseHeaders);
+  
+  res.status(200).end();
+});
+
+/* --------------------------- Health Checks ------------------------------ */
+// Health endpoints defined AFTER CORS middleware to ensure proper headers
+app.get('/health', async (_req, res) => {
+  // Lightweight health check - just verify server is running
+  if (!serverReady) {
+    return res.status(503).type('text/plain').send('Server starting...');
+  }
+  
+  // Server is ready - always return 200 for health check
+  // Browser readiness is checked separately and cached
+  res.status(200).type('text/plain').send('OK');
+});
+
+// Add /api/health endpoint for compatibility
+app.get('/api/health', async (_req, res) => {
+  // Same as /health but under /api path
+  if (!serverReady) {
+    return res.status(503).json({ status: 'Server starting...', ready: false });
+  }
+  
+  res.status(200).json({ status: 'OK', ready: true });
+});
+
+// Enhanced CORS test endpoint with detailed debugging
+app.get('/api/cors-test', (req, res) => {
+  const origin = req.headers.origin;
+  const userAgent = req.headers['user-agent'];
+  const allowed = isOriginAllowed(origin);
+  
+  console.log(`🔍 CORS test request from origin: "${origin}", allowed: ${allowed}`);
+  
+  res.json({ 
+    message: 'CORS test successful',
+    timestamp: new Date().toISOString(),
+    origin: origin,
+    originAllowed: allowed,
+    corsHeaders: {
+      'access-control-allow-origin': res.getHeader('access-control-allow-origin'),
+      'access-control-allow-methods': res.getHeader('access-control-allow-methods'),
+      'access-control-allow-headers': res.getHeader('access-control-allow-headers'),
+      'access-control-allow-credentials': res.getHeader('access-control-allow-credentials'),
+      'access-control-max-age': res.getHeader('access-control-max-age')
+    },
+    requestHeaders: {
+      origin: origin,
+      userAgent: userAgent,
+      referer: req.headers.referer,
+      host: req.headers.host,
+      'access-control-request-method': req.headers['access-control-request-method'],
+      'access-control-request-headers': req.headers['access-control-request-headers']
+    },
+    configuration: {
+      allowlist: ALLOWLIST,
+      staticOrigins: staticAllow,
+      envOrigins: envAllow,
+      env: {
+        ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
+        NODE_ENV: process.env.NODE_ENV,
+      }
+    },
+    serverInfo: {
+      serverReady: serverReady,
+      playwrightReady: playwrightReady,
+      lastBrowserCheck: lastBrowserCheckTime ? new Date(lastBrowserCheckTime).toISOString() : null
+    }
+  });
+});
 
 /* ----------------------------- body parsers ------------------------------- */
 app.use(express.json({ limit: '20mb' }));
@@ -97,7 +458,72 @@ interface PoliceFormData {
   [key: string]: any; // allow dynamic lookup
 }
 
-/* -------------------------------- Helpers -------------------------------- */
+/* ------------------------ Startup Readiness Check ----------------------- */
+async function performStartupReadinessCheck() {
+  console.log('🔍 Performing startup readiness checks...');
+  
+  // Mark server as ready immediately - health checks should pass
+  serverReady = true;
+  
+  // Perform background browser check without blocking startup
+  setTimeout(async () => {
+    try {
+      console.log('🔍 Background browser availability check...');
+      playwrightReady = await checkBrowserAvailability();
+      lastBrowserCheckTime = Date.now();
+      
+      if (playwrightReady) {
+        console.log('✅ Browser availability verified in background');
+      } else {
+        console.log('⚠️  Browser not available - API requests will fail until browsers are ready');
+      }
+    } catch (error) {
+      console.error('❌ Background browser check failed:', error);
+      playwrightReady = false;
+    }
+  }, 2000); // Start browser check 2 seconds after server startup
+  
+  return true;
+}
+
+/* ----------------------- Enhanced Browser Management ---------------------- */
+async function launchBrowserWithRetry(maxRetries = 3): Promise<any> {
+  const timeout = getPlaywrightTimeout();
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`Attempting to launch browser (attempt ${attempt}/${maxRetries}) with ${timeout}ms timeout...`);
+      
+      const browser = await chromium.launch({ 
+        headless: process.env.PLAYWRIGHT_HEADLESS !== 'false',
+        timeout,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--disable-gpu'
+        ]
+      });
+      
+      console.log('✅ Browser launched successfully');
+      return browser;
+    } catch (error) {
+      console.error(`❌ Browser launch attempt ${attempt} failed:`, error);
+      
+      if (attempt === maxRetries) {
+        throw new Error(`Failed to launch browser after ${maxRetries} attempts: ${error}`);
+      }
+      
+      // Wait before retry with exponential backoff
+      const delay = 2000 * Math.pow(2, attempt - 1);
+      console.log(`⏳ Waiting ${delay}ms before retry...`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+}
 function assertDOB_DDMMYYYY(input: string) {
   if (!/^\d{2}-\d{2}-\d{4}$/.test(input)) {
     throw new Error('DOB must be in DD-MM-YYYY format');
@@ -174,6 +600,30 @@ app.post('/api/police/submit/tenant', async (req, res) => {
   try { assertDOB_DDMMYYYY(p.date_of_birth); }
   catch (e: any) { return res.status(400).json({ ok: false, error: e.message }); }
 
+  if (!serverReady) {
+    return res.status(503).json({ ok: false, error: 'Server not ready yet, please try again' });
+  }
+
+  // Check browser availability with current cache
+  const now = Date.now();
+  if ((now - lastBrowserCheckTime) >= BROWSER_CHECK_CACHE_DURATION) {
+    // Refresh browser status in background
+    setTimeout(async () => {
+      playwrightReady = await checkBrowserAvailability();
+      lastBrowserCheckTime = Date.now();
+    }, 0);
+  }
+
+  if (!playwrightReady) {
+    return res.status(503).json({ 
+      ok: false, 
+      error: 'Browser services not available yet, please try again in a moment',
+      hint: 'Check /browser-status for current browser availability'
+    });
+  }
+
+  console.log(`📋 Processing police form submission for: ${p.first_name} ${p.last_name}`);
+
   const def = {
     availFrom: '10',
     availTo: '18',
@@ -194,11 +644,15 @@ app.post('/api/police/submit/tenant', async (req, res) => {
   };
   const computedAge = p.age || computeAgeFromDob(p.date_of_birth);
 
-  const browser = await chromium.launch({ headless: true });
-  const ctx = await browser.newContext();
-  const page = await ctx.newPage();
-
+  let browser = null;
+  let ctx = null;
+  
   try {
+    browser = await launchBrowserWithRetry();
+    ctx = await browser.newContext();
+    const page = await ctx.newPage();
+
+    console.log('🌐 Navigating to police website...');
     await page.goto('https://www.police.rajasthan.gov.in/old/verificationform.aspx', { waitUntil: 'domcontentloaded' });
     await page.waitForLoadState('networkidle');
 
@@ -208,6 +662,7 @@ app.post('/api/police/submit/tenant', async (req, res) => {
       await page.waitForLoadState('networkidle');
     }
 
+    console.log('📝 Filling form fields...');
     // Tenant identity
     await selectIfExists(page, ['#ContentPlaceHolder1_ddlTIdCardType'], p.id_type);
     await setIfExists(page, ['#ContentPlaceHolder1_txtTIdNo'], p.id_number);
@@ -268,6 +723,7 @@ app.post('/api/police/submit/tenant', async (req, res) => {
 
     await setIfExists(page, ['#ContentPlaceHolder1_txtLRefer'], def.referencedBy);
 
+    console.log('📁 Processing file uploads...');
     // Files
     const tenantPhoto = await downloadToTemp(p.passport_photo_url);
     await page.setInputFiles('#ContentPlaceHolder1_flTPhoto', tenantPhoto).catch(() => {});
@@ -276,6 +732,7 @@ app.post('/api/police/submit/tenant', async (req, res) => {
       await page.setInputFiles('#ContentPlaceHolder1_flTPhotoId', idPhoto).catch(() => {});
     }
 
+    console.log('🚀 Submitting form...');
     // Submit
     const SAVE_BTN = '#ContentPlaceHolder1_btnTSave, #ContentPlaceHolder1_btnSubmit';
     await page.waitForSelector(SAVE_BTN, { state: 'visible' });
@@ -299,6 +756,7 @@ app.post('/api/police/submit/tenant', async (req, res) => {
     });
     if (hasError) throw new Error('Validation error on target site. Check required fields / formats.');
 
+    console.log('🔍 Extracting reference number...');
     // Extract Reference No
     let referenceNo: string | null = null;
     const candidates = [
@@ -321,18 +779,79 @@ app.post('/api/police/submit/tenant', async (req, res) => {
     }
     if (!referenceNo) throw new Error('Reference number not found after submission.');
 
+    console.log(`✅ Form submitted successfully. Reference: ${referenceNo}`);
     res.json({ ok: true, referenceNo });
   } catch (e: any) {
+    console.error('❌ Form submission failed:', e);
     res.status(500).json({ ok: false, error: e.message || String(e) });
   } finally {
-    await ctx.close().catch(() => {});
-    await browser.close().catch(() => {});
+    if (ctx) {
+      await ctx.close().catch((err: any) => console.error('Error closing context:', err));
+    }
+    if (browser) {
+      await browser.close().catch((err: any) => console.error('Error closing browser:', err));
+    }
   }
 });
 
 /* --------------------------------- start --------------------------------- */
 const port = Number(process.env.PORT || 3000);
-app.listen(port, '0.0.0.0', () => {
-  console.log(`🚦 Listening on 0.0.0.0:${port}`);
-  console.log(`Health: http://localhost:${port}/health`);
-});
+
+// Graceful shutdown handling
+let server: any;
+
+async function gracefulShutdown(signal: string) {
+  console.log(`\n🛑 Received ${signal}. Starting graceful shutdown...`);
+  
+  if (server) {
+    server.close(() => {
+      console.log('✅ HTTP server closed.');
+      process.exit(0);
+    });
+    
+    // Force close after 10 seconds
+    setTimeout(() => {
+      console.log('⚠️  Forced shutdown after timeout');
+      process.exit(1);
+    }, 10000);
+  } else {
+    process.exit(0);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Startup sequence
+async function startServer() {
+  try {
+    console.log('🚀 Starting Police Form Automation Service...');
+    console.log(`📊 Environment: NODE_ENV=${process.env.NODE_ENV}`);
+    console.log(`📊 Playwright Headless: ${process.env.PLAYWRIGHT_HEADLESS !== 'false'}`);
+    console.log(`📊 Playwright Timeout: ${getPlaywrightTimeout()}ms`);
+    console.log(`📊 Port: ${port}`);
+    
+    // Perform startup readiness checks
+    await performStartupReadinessCheck();
+    
+    // Start the server
+    server = app.listen(port, '0.0.0.0', () => {
+      console.log(`🚦 Server ready and listening on 0.0.0.0:${port}`);
+      console.log(`📊 Health check: http://localhost:${port}/health`);
+      console.log(`📊 API Health check: http://localhost:${port}/api/health`);
+      console.log(`🔍 Browser status: http://localhost:${port}/browser-status`);
+      console.log(`🔍 API Browser status: http://localhost:${port}/api/browser-status`);
+      console.log(`🔗 Police form API: http://localhost:${port}/api/police/submit/tenant`);
+      console.log(`✅ Service is operational (server=${serverReady}, browser_check_in_progress)`);
+      console.log(`💡 Browser availability will be verified in background`);
+    });
+    
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    console.error('💡 This is likely due to Playwright browser unavailability in production');
+    process.exit(1);
+  }
+}
+
+// Start the server
+startServer();

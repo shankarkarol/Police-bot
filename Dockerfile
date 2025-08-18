@@ -7,10 +7,10 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm install --no-audit --no-fund
 
-# Build TypeScript
+# Build TypeScript - ensure tsc is available in PATH
 COPY tsconfig.json ./
 COPY src ./src
-RUN npm run build
+RUN npx --yes tsc
 
 # Optional: slim the image (keep only prod deps after build)
 RUN npm prune --omit=dev
